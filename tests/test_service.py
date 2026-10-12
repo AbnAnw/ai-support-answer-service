@@ -14,6 +14,11 @@ SAMPLE_KB = PROJECT_ROOT / "kb.json"
 
 
 class ServiceTests(unittest.TestCase):
+    def write_temporary_kb(self, directory: str, payload: object) -> Path:
+        path = Path(directory) / "replacement.json"
+        path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        return path
+
     def assert_valid_schema(self, result: dict[str, object]) -> None:
         self.assertEqual(
             set(result), {"question", "decision", "answer", "citations", "debug"}
@@ -102,6 +107,120 @@ class ServiceTests(unittest.TestCase):
         )
         self.assertEqual(result["decision"], "abstain")
 
+    def test_support_agent_actor_action_mismatches_abstain(self) -> None:
+        questions = (
+            "Can support agents reset my password?",
+            "Can support agents send a reset link?",
+        )
+        for question in questions:
+            with self.subTest(question=question):
+                self.assertEqual(
+                    answer_question(question, SAMPLE_KB)["decision"], "abstain"
+                )
+
+    def test_quantity_cannot_move_between_unrelated_sentences(self) -> None:
+        payload = [
+            {
+                "id": "shipping",
+                "title": "Refunds and delivery",
+                "text": (
+                    "Refunds are available within 30 days. "
+                    "Express delivery is available within 2 hours."
+                ),
+            }
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write_temporary_kb(directory, payload)
+            result = answer_question("Are refunds available within 2 hours?", path)
+            self.assertEqual(result["decision"], "abstain")
+
+    def test_actor_action_object_cannot_move_between_sentences(self) -> None:
+        payload = [
+            {
+                "id": "actions",
+                "title": "Account actions",
+                "text": (
+                    "Alice can reset her password. "
+                    "Bob can change the email address."
+                ),
+            }
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write_temporary_kb(directory, payload)
+            result = answer_question("Can Alice change the email address?", path)
+            self.assertEqual(result["decision"], "abstain")
+
+    def test_supported_negative_capability_answers_from_exact_sentence(self) -> None:
+        result = answer_question(
+            "Can support send me my existing password?", SAMPLE_KB
+        )
+        self.assertEqual(result["decision"], "answer")
+        self.assertIn("cannot", result["answer"])
+        self.assertIn("existing passwords", result["answer"])
+        self.assert_citations_are_grounded(result, SAMPLE_KB)
+
+    def test_paraphrases_and_number_words_are_supported(self) -> None:
+        questions = (
+            "How soon does the password reset link expire?",
+            "Does the password reset link expire in thirty minutes?",
+            "How do I enable 2FA?",
+            "Can I use SMS for two-factor authentication?",
+            "Can I close my account with a balance of 0?",
+            "How long do withdrawal reviews usually take?",
+        )
+        for question in questions:
+            with self.subTest(question=question):
+                result = answer_question(question, SAMPLE_KB)
+                self.assertEqual(result["decision"], "answer")
+                self.assert_citations_are_grounded(result, SAMPLE_KB)
+
+    def test_qualification_and_requirement_conflicts_abstain(self) -> None:
+        questions = (
+            "Can you guarantee my withdrawal will finish in 2 hours?",
+            "Will my withdrawal definitely finish within 24 hours?",
+            "Can I close my account without closing open positions?",
+            "Can I remove 2FA without identity verification?",
+        )
+        for question in questions:
+            with self.subTest(question=question):
+                self.assertEqual(
+                    answer_question(question, SAMPLE_KB)["decision"], "abstain"
+                )
+
+    def test_complete_multi_part_answer_uses_all_approved_sentences(self) -> None:
+        result = answer_question(
+            "Where do I reset my password, where is the link sent, and when does it expire?",
+            SAMPLE_KB,
+        )
+        self.assertEqual(result["decision"], "answer")
+        self.assertIn("login page", result["answer"])
+        self.assertIn("registered email address", result["answer"])
+        self.assertIn("30 minutes", result["answer"])
+        self.assertEqual(len(result["citations"]), 3)
+        self.assert_citations_are_grounded(result, SAMPLE_KB)
+
+    def test_replacement_kb_policy_is_authoritative(self) -> None:
+        payload = [
+            {
+                "id": "policy",
+                "title": "Tax guidance",
+                "text": (
+                    "Support provides general tax guidance about downloading "
+                    "annual tax statements."
+                ),
+            }
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write_temporary_kb(directory, payload)
+            result = answer_question("What tax guidance does support provide?", path)
+            self.assertEqual(result["decision"], "answer")
+            self.assertEqual(result["citations"][0]["id"], "policy")
+            self.assert_citations_are_grounded(result, path)
+
+    def test_sample_kb_advice_prohibition_still_abstains(self) -> None:
+        result = answer_question("What tax advice does support provide?", SAMPLE_KB)
+        self.assertEqual(result["decision"], "abstain")
+
     def test_partially_supported_multi_part_question_abstains(self) -> None:
         result = answer_question(
             "How do I reset my password and change my username?", SAMPLE_KB
@@ -114,7 +233,6 @@ class ServiceTests(unittest.TestCase):
 
     def test_temporary_replacement_kb_changes_behavior(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "replacement.json"
             payload = [
                 {
                     "id": "novel_1",
@@ -122,7 +240,7 @@ class ServiceTests(unittest.TestCase):
                     "text": "Moonstone invoices can be downloaded from the lunar billing page.",
                 }
             ]
-            path.write_text(json.dumps(payload), encoding="utf-8")
+            path = self.write_temporary_kb(directory, payload)
             result = answer_question(
                 "Where can I download Moonstone invoices?", path
             )

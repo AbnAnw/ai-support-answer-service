@@ -32,6 +32,26 @@ class RetrievalTests(unittest.TestCase):
         self.assertEqual(tokenize("Withdrawals"), ("withdraw",))
         self.assertEqual(tokenize("Two-factor authentication"), ("2fa", "authentication"))
 
+    def test_required_morphology_and_number_words_are_canonical(self) -> None:
+        groups = (
+            (("enable", "enabled", "enabling"), "enable"),
+            (("remove", "removed", "removing"), "remove"),
+            (("use", "used", "using"), "use"),
+            (("close", "closed", "closure"), "close"),
+            (("expire", "expires", "expired", "expiry"), "expire"),
+            (("send", "sent", "sending"), "send"),
+            (("withdraw", "withdrawal"), "withdraw"),
+            (("require", "required", "requirement", "requirements"), "require"),
+            (("0", "zero"), "0"),
+            (("2", "two"), "2"),
+            (("30", "thirty"), "30"),
+        )
+        for variants, expected in groups:
+            with self.subTest(variants=variants):
+                self.assertEqual(
+                    {tokenize(variant)[0] for variant in variants}, {expected}
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

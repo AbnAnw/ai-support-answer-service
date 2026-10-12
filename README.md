@@ -72,7 +72,7 @@ Both commands are offline and use only the Python standard library. Replacement-
   ],
   "debug": {
     "retrieved_ids": ["doc_1"],
-    "support_score": 0.892798
+    "support_score": 0.972639
   }
 }
 ```
@@ -87,7 +87,7 @@ Both commands are offline and use only the Python standard library. Replacement-
   "citations": [],
   "debug": {
     "retrieved_ids": ["doc_5", "doc_1", "doc_2"],
-    "support_score": 0.578221
+    "support_score": 0.448381
   }
 }
 ```
@@ -114,7 +114,7 @@ To replace the KB, either overwrite `kb.json` using the same schema or supply `-
 
 ## Retrieval method
 
-Preprocessing applies Unicode NFKC normalization, case folding, Unicode-aware word extraction, a small English stop-word set, conservative suffix normalization, and adjacent bigrams. Negations, quantities, and time units are retained.
+Preprocessing applies Unicode NFKC normalization, case folding, Unicode-aware word extraction, a small English stop-word set, conservative suffix normalization, number-word normalization, and adjacent bigrams. Common forms such as `enable/enabled/enabling`, `expire/expires/expired/expiry`, and `0/zero` are canonicalized. Negations, qualifications, quantities, and time units are retained.
 
 For each request, the retriever builds a small in-memory index from the current KB:
 
@@ -136,46 +136,47 @@ This uses more than raw shared-word counts: common function words are removed, r
 
 ## Support rule
 
-The support checker uses only the highest-ranked coherent document. It does not combine unrelated fragments from multiple documents to manufacture an answer.
+The support checker evaluates retrieved documents in rank order, but retrieval rank cannot approve an answer. It splits an explicit multi-part question into requested clauses and tests each clause against individual source sentences. Every central actor, action, object, polarity, number, time unit, method, and requested outcome must be supported in the same sentence. A single-topic document title may supply topic context, but title actions cannot be attached to a different sentence.
+
+A multi-part answer may use several sentences only when every clause independently passes and the selected sentences form one contiguous passage. This prevents a quantity, actor, or action from one sentence being attached to a different subject elsewhere in the article.
 
 Its score, clamped to `0.0–1.0`, is:
 
 ```text
-0.40 × top retrieval score
-+ 0.30 × meaningful concept coverage
-+ 0.20 × critical-facet coverage
-+ 0.10 × phrase consistency
+0.75 × passage facet coverage
++ 0.15 × phrase consistency
++ 0.10 × document retrieval score
 ```
 
-`support_score` is therefore lexical confidence that the top evidence covers the complete request; it is not a probability.
+`support_score` is therefore a deterministic measure of passage-level lexical support; it is not a probability. Retrieval contributes only 10% and can never override a missing or conflicting relationship.
 
 An answer requires all of the following:
 
 - support score at least `0.62`;
-- concept coverage at least `0.60`;
-- critical-facet coverage at least `0.75`;
-- coherent evidence with at least two meaningful concepts in one sentence or a matching bigram;
-- no missing critical term, requested number/time unit, or polarity conflict.
+- complete critical-facet coverage inside each approved sentence;
+- matching numbers and time units for the same subject;
+- no polarity, requirement, or certainty conflict;
+- one contiguous evidence passage when the question contains multiple clauses.
 
 Conservative overrides apply even when a numeric score is high:
 
-- legal- or tax-advice requests abstain;
-- guarantees require explicit guarantee-equivalent evidence for the same outcome;
-- requested numbers and time units must match the evidence;
-- actor/action/object details must be present rather than merely topically related;
-- a multi-part request abstains when a central part is unsupported.
+- guarantees and definite outcomes require equally strong, unqualified evidence;
+- `usually`, `may`, `must`, `before`, `without`, and explicit negation retain their force;
+- requested numbers and time units must match the same sentence and subject;
+- actor/action/object details must coexist rather than merely appearing somewhere in the document;
+- a multi-part request abstains when any central clause is unsupported.
 
-An abstention usually has no citations. A citation may be included when a KB passage explicitly states the legal/tax restriction that caused the abstention.
+Policy is evidence-driven rather than hardcoded by topic. The sample KB's explicit prohibition causes advice requests to abstain, while a replacement KB that affirmatively permits general tax guidance is authoritative and can produce an answer.
 
 ## Answers and citations
 
-The generator is extractive. It ranks sentences within the approved document and selects the smallest one- or two-sentence evidence set that covers the question. It does not paraphrase procedures, invent details, or add a model-generated claim.
+The generator is extractive and receives only the exact passage approved by the support checker. It preserves every approved sentence needed for the requested clauses; there is no arbitrary two-sentence limit. It does not reselect document text, paraphrase procedures, invent details, or add a model-generated claim.
 
 Each citation contains the document ID, exact title, and a snippet copied verbatim from that document's `text`. Runtime invariant checks confirm that every citation references a loaded record, its title matches, and its snippet occurs in the source. Every `answer` result must have at least one citation.
 
 ## Chunking choice and tradeoff
 
-Whole FAQ records are ranked because the supplied articles are short and nearby sentences may supply necessary context. Sentences are ranked separately for concise answers and citations.
+Whole FAQ records are ranked because the supplied articles are short. Support is then checked sentence by sentence. Multi-part questions may use tightly related adjacent sentences, but one clause cannot combine facets from unrelated sentences. Citations are produced directly from the approved passage.
 
 This design is transparent and effective for small FAQ collections. Very long replacement articles may dilute document-level similarity; sentence- or paragraph-level indexing would be a better extension for long-form corpora.
 
@@ -184,13 +185,13 @@ This design is transparent and effective for small FAQ collections. Very long re
 ```text
 app.py                         CLI and JSON serialization boundary
 kb.json                        Sample runtime knowledge base
-validate.py                    Seven representative end-to-end checks
+validate.py                    22 representative and adversarial checks
 support_service/
   __init__.py                  Public package exports
   models.py                    Immutable stage data contracts
   kb.py                        Disk loading and schema validation
   retrieval.py                 Normalization, TF-IDF ranking, sentence ranking
-  support.py                   Explicit support gate and policy overrides
+  support.py                   Passage-scoped support and conflict checks
   answering.py                 Extractive answers and citations
   service.py                   Ordered pipeline and output invariants
 tests/
@@ -218,7 +219,7 @@ The loader, retriever, support checker, and generator are also importable and in
 - The lightweight suffix normalizer is intentionally not a full linguistic stemmer.
 - Sentence splitting is punctuation-based and may be imperfect around abbreviations.
 - Whole-document retrieval is intended for short FAQ articles, not long manuals.
-- The critical-facet checker cannot provide full semantic or contradiction understanding.
+- Relationship checking is deterministic and lexical; complex grammar, pronoun resolution, or implicit relationships can still cause safe false abstentions.
 - Thresholds may need reevaluation for a substantially different domain or document-length distribution.
 - The CLI processes one independent question at a time and has no conversation memory.
 
