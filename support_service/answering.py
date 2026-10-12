@@ -15,19 +15,9 @@ ABSTENTION_MESSAGE = (
 def _select_sentences(
     question: str, result: RetrievalResult, decision: SupportDecision
 ) -> tuple[str, ...]:
-    question_terms = set(tokenize(question))
-    candidates = decision.evidence or result.best_sentences
-    selected: list[str] = []
-    covered: set[str] = set()
-
-    for sentence in candidates:
-        contribution = question_terms.intersection(tokenize(sentence)) - covered
-        if contribution or not selected:
-            selected.append(sentence)
-            covered.update(question_terms.intersection(tokenize(sentence)))
-        if question_terms.issubset(covered) or len(selected) == 2:
-            break
-    return tuple(selected)
+    # The support stage has already approved the exact sentence-level passage.
+    # Re-selecting here could reintroduce unrelated document evidence.
+    return decision.evidence
 
 
 def generate_answer(
@@ -54,17 +44,18 @@ def generate_answer(
 
 
 def restriction_citation(
-    question: str, result: RetrievalResult | None, decision: SupportDecision
+    _question: str, result: RetrievalResult | None, decision: SupportDecision
 ) -> list[Citation]:
     """Return a citation only when a source explicitly states the restriction."""
 
-    if result is None or decision.reason_code != "RESTRICTED_ADVICE":
+    if result is None or decision.reason_code != "EVIDENCE_RESTRICTION":
         return []
-    question_terms = set(tokenize(question))
-    for sentence in result.best_sentences:
+    for sentence in decision.evidence:
         terms = set(tokenize(sentence))
-        if terms.intersection({"legal", "tax", "taxation"}) and terms.intersection(
-            {"advice", "advise"}
+        if (
+            terms.intersection({"advice", "advise", "counsel", "guidance"})
+            and "not" in terms
+            and "provide" in terms
         ):
             return [
                 Citation(result.document.id, result.document.title, sentence)

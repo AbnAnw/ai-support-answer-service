@@ -72,13 +72,22 @@ def answer_question(
     citations: list[Citation]
     if support.supported:
         # Stage 4a: ANSWER
-        answer, citations = generate_answer(clean_question, results[0], support)
+        approved_result = next(
+            (item for item in results if item.document.id == support.document_id), None
+        )
+        if approved_result is None:
+            raise RuntimeError("support decision does not reference retrieved evidence")
+        answer, citations = generate_answer(clean_question, approved_result, support)
         decision = "answer"
     else:
         # Stage 4b: ABSTAIN
         answer = ABSTENTION_MESSAGE
+        restriction_result = next(
+            (item for item in results if item.document.id == support.document_id),
+            results[0] if results else None,
+        )
         citations = restriction_citation(
-            clean_question, results[0] if results else None, support
+            clean_question, restriction_result, support
         )
         decision = "abstain"
 

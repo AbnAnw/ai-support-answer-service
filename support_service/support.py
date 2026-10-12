@@ -1,68 +1,20 @@
-"""Conservative, deterministic evidence support checks."""
+"""Passage-scoped, deterministic evidence support checks."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import re
 
 from .models import RetrievalResult, SupportDecision
-from .retrieval import bigrams, normalize_text, tokenize
+from .retrieval import bigrams, normalize_text, split_sentences, tokenize
 
 
 SUPPORT_THRESHOLD = 0.62
-MIN_CONCEPT_COVERAGE = 0.60
-MIN_CRITICAL_COVERAGE = 0.75
 
-_RESTRICTED_TOPICS = frozenset({"legal", "tax", "taxation"})
-_ADVICE_TERMS = frozenset({"advice", "advise", "recommendation", "recommend"})
-_GUARANTEE_TERMS = frozenset(
-    {"guarantee", "guaranteed", "promise", "promised", "certain", "definitely"}
-)
-_TIME_UNITS = frozenset(
-    {
-        "second",
-        "minute",
-        "hour",
-        "day",
-        "week",
-        "month",
-        "year",
-        "weekend",
-        "holiday",
-    }
-)
-_NUMBER_WORDS = frozenset(
-    {
-        "zero",
-        "one",
-        "two",
-        "three",
-        "four",
-        "five",
-        "six",
-        "seven",
-        "eight",
-        "nine",
-        "ten",
-        "eleven",
-        "twelve",
-        "thirteen",
-        "fourteen",
-        "fifteen",
-        "sixteen",
-        "seventeen",
-        "eighteen",
-        "nineteen",
-        "twenty",
-        "thirty",
-        "forty",
-        "fifty",
-        "sixty",
-        "hundred",
-    }
-)
-
-# These words frame a question but are not themselves a requested product fact.
-_QUERY_FRAMING_TERMS = frozenset(
+# Words that frame a request without identifying the fact that must be found.
+# Certainty, polarity, quantities, units, actors, actions, and objects are not
+# discarded here.
+_FRAMING_TERMS = frozenset(
     {
         "ask",
         "can",
@@ -76,148 +28,301 @@ _QUERY_FRAMING_TERMS = frozenset(
         "need",
         "provide",
         "question",
-        "requirement",
         "say",
-        "should",
+        "soon",
         "take",
         "tell",
         "want",
         "would",
     }
 )
+_POLARITY_TERMS = frozenset({"not", "never", "cannot", "without"})
+_STRONG_CERTAINTY_TERMS = frozenset(
+    {"always", "certain", "certainly", "definite", "definitely", "guarantee", "will"}
+)
+_WEAK_QUALIFIERS = frozenset({"may", "might", "usually", "can", "longer"})
+_ADVICE_TERMS = frozenset({"advice", "advise", "counsel", "guidance"})
+_ACTION_TERMS = frozenset(
+    {
+        "change",
+        "close",
+        "download",
+        "enable",
+        "expire",
+        "provide",
+        "remove",
+        "require",
+        "reset",
+        "send",
+        "update",
+        "use",
+    }
+)
+_NUMBER_OR_TIME_RE = re.compile(
+    r"^(?:\d+|second|minute|hour|day|week|month|year|weekend|holiday)$"
+)
+_CLAUSE_BOUNDARY_RE = re.compile(r"\s*[,;]\s*(?:and\s+)?", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class _ClauseMatch:
+    sentence: str
+    sentence_index: int
+    coverage: float
+    phrase_score: float
 
 
 def _clamp(value: float) -> float:
     return max(0.0, min(1.0, value))
 
 
-def _contains_restricted_advice(question_terms: set[str]) -> bool:
-    return bool(question_terms & _RESTRICTED_TOPICS) and bool(
-        question_terms & _ADVICE_TERMS
-    )
+def _split_clauses(question: str) -> tuple[str, ...]:
+    """Split explicit multi-part questions without breaking noun lists."""
+
+    parts = [part.strip() for part in _CLAUSE_BOUNDARY_RE.split(question) if part.strip()]
+    clauses: list[str] = []
+    for part in parts:
+        # Split conjunctions that clearly introduce another requested action or
+        # interrogative. "legal and tax advice" remains one clause.
+        subparts = re.split(
+            r"\s+and\s+(?=(?:where|when|how|what|who|why|can|could|does|do|will|"
+            r"reset|change|send|remove|close|enable|use|download|update)\b)",
+            part,
+            flags=re.IGNORECASE,
+        )
+        clauses.extend(subpart.strip() for subpart in subparts if subpart.strip())
+    return tuple(clauses) or (question.strip(),)
 
 
-def _is_guarantee_request(question_terms: set[str]) -> bool:
-    return bool(question_terms & _GUARANTEE_TERMS)
+def _critical_terms(clause: str) -> set[str]:
+    terms = set(tokenize(clause)) - _FRAMING_TERMS
+    normalized = normalize_text(clause)
+    # In "reset link expires/is sent", reset names the kind of link; expire or
+    # send is the requested relationship. Password remains as the topic context.
+    if "reset" in terms and "link" in terms and terms.intersection({"expire", "send"}):
+        terms.remove("reset")
+    if re.search(r"\bhow\s+(?:long|soon)\b", normalized):
+        terms.add("__duration__")
+    return terms
 
 
-def _meaningful_terms(question: str) -> set[str]:
-    return set(tokenize(question)) - _QUERY_FRAMING_TERMS
+def _title_context(title: str) -> set[str]:
+    """Use only a single-topic title as local sentence context.
+
+    A compound title such as "Refunds and delivery" cannot attach the refund
+    subject to a delivery sentence and manufacture a relationship.
+    """
+
+    normalized = normalize_text(title)
+    if re.search(r"\b(?:and|or)\b|[/&]", normalized):
+        return set()
+    # A title may establish a local topic (for example 2FA), but an action in a
+    # title may not be attached to a sentence about a different actor/action.
+    return set(tokenize(title)) - _ACTION_TERMS
 
 
-def _numeric_or_time_terms(terms: set[str]) -> set[str]:
-    return {
-        term
-        for term in terms
-        if term.isdigit() or term in _NUMBER_WORDS or term in _TIME_UNITS
-    }
-
-
-def _has_coherent_sentence(question: str, result: RetrievalResult) -> bool:
-    query_terms = _meaningful_terms(question)
-    query_bigrams = set(bigrams(tokenize(question)))
-    for sentence in result.best_sentences:
-        sentence_tokens = tokenize(sentence)
-        sentence_terms = set(sentence_tokens)
-        if len(query_terms.intersection(sentence_terms)) >= 2:
-            return True
-        if query_bigrams.intersection(bigrams(sentence_tokens)):
-            return True
+def _term_is_satisfied(term: str, evidence_terms: set[str]) -> bool:
+    if term in evidence_terms:
+        return True
+    if term == "__duration__":
+        has_number = any(item.isdigit() for item in evidence_terms)
+        has_unit = any(
+            item in {"second", "minute", "hour", "day", "week", "month", "year"}
+            for item in evidence_terms
+        )
+        return has_number and has_unit
+    if term == "require" and "must" in evidence_terms:
+        return True
+    # "Supported methods are ... SMS" directly supports "Can I use SMS?"
+    if term == "use" and {"support", "method"}.issubset(evidence_terms):
+        return True
     return False
 
 
-def _has_conflicting_number(question_terms: set[str], evidence_terms: set[str]) -> bool:
-    requested_numbers = {
-        term for term in question_terms if term.isdigit() or term in _NUMBER_WORDS
-    }
-    if not requested_numbers:
+def _coverage(required: set[str], evidence_terms: set[str]) -> float:
+    if not required:
+        return 0.0
+    matched = sum(_term_is_satisfied(term, evidence_terms) for term in required)
+    return matched / len(required)
+
+
+def _phrase_score(clause: str, sentence: str) -> float:
+    query_bigrams = set(bigrams(tokenize(clause)))
+    if not query_bigrams:
+        return 0.0
+    sentence_bigrams = set(bigrams(tokenize(sentence)))
+    return len(query_bigrams.intersection(sentence_bigrams)) / len(query_bigrams)
+
+
+def _has_quantity_mismatch(required: set[str], evidence_terms: set[str]) -> bool:
+    quantities = {term for term in required if _NUMBER_OR_TIME_RE.match(term)}
+    return any(not _term_is_satisfied(term, evidence_terms) for term in quantities)
+
+
+def _has_polarity_conflict(clause: str, evidence_terms: set[str]) -> bool:
+    query_terms = set(tokenize(clause, remove_stop_words=False))
+    requested_polarity = query_terms.intersection(_POLARITY_TERMS)
+    if not requested_polarity:
+        # A neutral capability question may be answered by explicit negative
+        # evidence, e.g. "Can support send my existing password?" → "cannot".
         return False
-    return not requested_numbers.issubset(evidence_terms)
+    return not requested_polarity.issubset(evidence_terms)
+
+
+def _has_certainty_conflict(clause: str, evidence_terms: set[str]) -> bool:
+    query_terms = set(tokenize(clause, remove_stop_words=False))
+    requested_certainty = query_terms.intersection(_STRONG_CERTAINTY_TERMS)
+    if not requested_certainty:
+        return False
+    explicit_certainty = evidence_terms.intersection(_STRONG_CERTAINTY_TERMS)
+    return not explicit_certainty or bool(evidence_terms.intersection(_WEAK_QUALIFIERS))
+
+
+def _is_evidence_restriction(clause: str, evidence_terms: set[str]) -> bool:
+    """Recognize a retrieved prohibition without hardcoding a topic."""
+
+    clause_terms = set(tokenize(clause))
+    asks_for_advice = bool(clause_terms.intersection(_ADVICE_TERMS))
+    prohibits_provision = "not" in evidence_terms and "provide" in evidence_terms
+    return asks_for_advice and prohibits_provision
+
+
+def _match_clause(
+    clause: str,
+    sentences: tuple[str, ...],
+    title_terms: set[str],
+) -> tuple[_ClauseMatch | None, float, str | None]:
+    required = _critical_terms(clause)
+    if not required:
+        return None, 0.0, "NO_MEANINGFUL_TERMS"
+
+    best_score = 0.0
+    best_reason: str | None = None
+    for index, sentence in enumerate(sentences):
+        sentence_terms = set(tokenize(sentence, remove_stop_words=False))
+        evidence_terms = sentence_terms.union(title_terms)
+        coverage = _coverage(required, evidence_terms)
+        phrase = _phrase_score(clause, sentence)
+        candidate_score = 0.85 * coverage + 0.15 * phrase
+        if candidate_score > best_score:
+            best_score = candidate_score
+
+        # All critical actor/action/object/quantity facets must coexist in this
+        # sentence (with safe, single-topic title context).
+        if coverage < 1.0:
+            continue
+        if _has_quantity_mismatch(required, evidence_terms):
+            best_reason = "QUANTITY_MISMATCH"
+            continue
+        if _has_polarity_conflict(clause, evidence_terms):
+            best_reason = "POLARITY_CONFLICT"
+            continue
+        if _has_certainty_conflict(clause, evidence_terms):
+            best_reason = "QUALIFICATION_CONFLICT"
+            continue
+        if _is_evidence_restriction(clause, evidence_terms):
+            return (
+                _ClauseMatch(sentence, index, coverage, phrase),
+                candidate_score,
+                "EVIDENCE_RESTRICTION",
+            )
+        return _ClauseMatch(sentence, index, coverage, phrase), candidate_score, None
+
+    return None, best_score, best_reason or "MISSING_PASSAGE_FACETS"
+
+
+def _passage_is_tight(matches: tuple[_ClauseMatch, ...]) -> bool:
+    indexes = sorted({match.sentence_index for match in matches})
+    if len(indexes) <= 1:
+        return True
+    return indexes[-1] - indexes[0] + 1 == len(indexes)
+
+
+def _passage_score(
+    matches: tuple[_ClauseMatch, ...], retrieval_score: float
+) -> float:
+    if not matches:
+        return 0.0
+    facet_coverage = sum(match.coverage for match in matches) / len(matches)
+    phrase_consistency = sum(match.phrase_score for match in matches) / len(matches)
+    # Facet coverage is one signal, not duplicated as both concept and critical
+    # coverage. Retrieval is deliberately a small tie-breaking contribution.
+    return _clamp(
+        0.75 * facet_coverage
+        + 0.15 * phrase_consistency
+        + 0.10 * retrieval_score
+    )
 
 
 def check_support(
     question: str, results: tuple[RetrievalResult, ...]
 ) -> SupportDecision:
-    """Decide whether the highest-ranked evidence supports the full question.
-
-    Retrieval scores help rank likely evidence, but never bypass critical-facet
-    and policy checks. Only the top coherent document is used for an answer;
-    unrelated fragments are not combined to manufacture support.
-    """
+    """Approve only a passage that supports every requested clause locally."""
 
     if not results:
         return SupportDecision(False, 0.0, "NO_EVIDENCE", ())
 
-    top = results[0]
-    question_terms = set(tokenize(question))
-    evidence_text = f"{top.document.title} {top.document.text}"
-    evidence_terms = set(tokenize(evidence_text))
-    meaningful = _meaningful_terms(question)
-    matched_meaningful = meaningful.intersection(evidence_terms)
-    concept_coverage = (
-        len(matched_meaningful) / len(meaningful) if meaningful else 0.0
+    clauses = _split_clauses(question)
+    best_rejected_score = 0.0
+    best_rejected_reason = "MISSING_PASSAGE_FACETS"
+    best_rejected_evidence: tuple[str, ...] = ()
+    best_rejected_document: str | None = None
+
+    for result in results:
+        sentences = split_sentences(result.document.text)
+        title_terms = _title_context(result.document.title)
+        matches: list[_ClauseMatch] = []
+        rejected = False
+
+        for clause in clauses:
+            match, clause_score, reason = _match_clause(clause, sentences, title_terms)
+            if reason == "EVIDENCE_RESTRICTION" and match is not None:
+                score = _clamp(0.90 * clause_score + 0.10 * result.score)
+                if score > best_rejected_score:
+                    best_rejected_score = score
+                    best_rejected_reason = reason
+                    best_rejected_evidence = (match.sentence,)
+                    best_rejected_document = result.document.id
+                rejected = True
+                break
+            if match is None:
+                score = _clamp(0.90 * clause_score + 0.10 * result.score)
+                if score > best_rejected_score:
+                    best_rejected_score = score
+                    best_rejected_reason = reason or "MISSING_PASSAGE_FACETS"
+                    best_rejected_evidence = ()
+                    best_rejected_document = result.document.id
+                rejected = True
+                break
+            matches.append(match)
+
+        if rejected:
+            continue
+
+        match_tuple = tuple(matches)
+        score = _passage_score(match_tuple, result.score)
+        if not _passage_is_tight(match_tuple):
+            if score > best_rejected_score:
+                best_rejected_score = score
+                best_rejected_reason = "DISJOINT_PASSAGE"
+                best_rejected_document = result.document.id
+            continue
+        if score < SUPPORT_THRESHOLD:
+            if score > best_rejected_score:
+                best_rejected_score = score
+                best_rejected_reason = "LOW_PASSAGE_SCORE"
+                best_rejected_document = result.document.id
+            continue
+
+        selected_indexes = sorted({match.sentence_index for match in match_tuple})
+        evidence = tuple(sentences[index] for index in selected_indexes)
+        return SupportDecision(True, score, "SUPPORTED", evidence, result.document.id)
+
+    return SupportDecision(
+        False,
+        best_rejected_score,
+        best_rejected_reason,
+        best_rejected_evidence,
+        best_rejected_document,
     )
-
-    critical_terms = {
-        term
-        for term in meaningful
-        if term not in _QUERY_FRAMING_TERMS
-    }
-    critical_coverage = (
-        len(critical_terms.intersection(evidence_terms)) / len(critical_terms)
-        if critical_terms
-        else 0.0
-    )
-    phrase_consistency = top.bigram_coverage
-    support_score = _clamp(
-        0.40 * top.score
-        + 0.30 * concept_coverage
-        + 0.20 * critical_coverage
-        + 0.10 * phrase_consistency
-    )
-    evidence = top.best_sentences
-
-    if _contains_restricted_advice(question_terms):
-        return SupportDecision(False, support_score, "RESTRICTED_ADVICE", evidence)
-
-    if _is_guarantee_request(question_terms):
-        normalized_evidence = set(tokenize(evidence_text, remove_stop_words=False))
-        if not normalized_evidence.intersection(_GUARANTEE_TERMS):
-            return SupportDecision(
-                False, support_score, "UNSUPPORTED_GUARANTEE", evidence
-            )
-
-    if _has_conflicting_number(question_terms, evidence_terms):
-        return SupportDecision(False, support_score, "MISSING_CRITICAL_FACET", evidence)
-
-    # A time unit in the request must be present in the evidence. A request for
-    # an unspecified duration ("how long") is allowed when the evidence supplies
-    # a concrete number and time unit.
-    requested_time = _numeric_or_time_terms(question_terms) & _TIME_UNITS
-    if requested_time and not requested_time.issubset(evidence_terms):
-        return SupportDecision(False, support_score, "MISSING_CRITICAL_FACET", evidence)
-
-    unmatched = critical_terms - evidence_terms
-    if unmatched:
-        return SupportDecision(False, support_score, "MISSING_CRITICAL_FACET", evidence)
-
-    if concept_coverage < MIN_CONCEPT_COVERAGE:
-        return SupportDecision(False, support_score, "LOW_CONCEPT_COVERAGE", evidence)
-    if critical_coverage < MIN_CRITICAL_COVERAGE:
-        return SupportDecision(False, support_score, "MISSING_CRITICAL_FACET", evidence)
-    if not _has_coherent_sentence(question, top):
-        return SupportDecision(False, support_score, "INCOHERENT_EVIDENCE", evidence)
-    if support_score < SUPPORT_THRESHOLD:
-        return SupportDecision(False, support_score, "LOW_SCORE", evidence)
-
-    # Detect explicit polarity conflicts for the small set of critical
-    # negations without exposing internal reasoning in the public result.
-    normalized_question = normalize_text(question)
-    normalized_evidence = normalize_text(evidence_text)
-    if re.search(r"\b(cannot|never|not)\b", normalized_question) and not re.search(
-        r"\b(cannot|never|not)\b", normalized_evidence
-    ):
-        return SupportDecision(False, support_score, "CONFLICTING_EVIDENCE", evidence)
-
-    return SupportDecision(True, support_score, "SUPPORTED", evidence)
 

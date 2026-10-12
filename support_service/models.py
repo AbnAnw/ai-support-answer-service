@@ -29,6 +29,7 @@ class SupportDecision:
     score: float
     reason_code: str
     evidence: tuple[str, ...]
+    document_id: str | None = None
 
 
 @dataclass(frozen=True)

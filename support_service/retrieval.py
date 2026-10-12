@@ -59,13 +59,28 @@ _WORD_RE = re.compile(r"[^\W_]+", re.UNICODE)
 _SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?])\s+")
 
 _CANONICAL = {
+    "enabled": "enable",
+    "enabling": "enable",
+    "expired": "expire",
+    "expires": "expire",
+    "expiry": "expire",
+    "removed": "remove",
+    "removing": "remove",
+    "used": "use",
+    "using": "use",
     "closure": "close",
     "closing": "close",
     "closed": "close",
+    "sent": "send",
+    "sending": "send",
     "withdrawal": "withdraw",
     "withdrawals": "withdraw",
-    "requirements": "requirement",
+    "requirements": "require",
     "required": "require",
+    "requirement": "require",
+    "zero": "0",
+    "two": "2",
+    "thirty": "30",
 }
 
 
