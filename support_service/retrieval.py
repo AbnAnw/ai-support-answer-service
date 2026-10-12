@@ -37,6 +37,7 @@ STOP_WORDS = frozenset(
         "of",
         "on",
         "or",
+        "please",
         "the",
         "their",
         "them",

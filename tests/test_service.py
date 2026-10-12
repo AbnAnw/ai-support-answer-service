@@ -50,6 +50,11 @@ class ServiceTests(unittest.TestCase):
         self.assert_citations_are_grounded(result, SAMPLE_KB)
         self.assertEqual(result["debug"]["retrieved_ids"][0], "doc_1")
 
+    def test_polite_framing_does_not_cause_false_abstention(self) -> None:
+        result = answer_question("Please tell me how to reset my password.", SAMPLE_KB)
+        self.assertEqual(result["decision"], "answer")
+        self.assert_citations_are_grounded(result, SAMPLE_KB)
+
     def test_answerable_two_factor_recovery(self) -> None:
         result = answer_question(
             "What happens if I lose access to my second factor?", SAMPLE_KB
